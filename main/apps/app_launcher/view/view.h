@@ -34,6 +34,24 @@ public:
     void init(std::vector<mooncake::AppProps_t> appPorps);
     void update();
 
+    /**
+     * @brief Park the launcher while another app owns the screen.
+     *
+     * The whole icon tree stays allocated so coming back costs nothing, but the
+     * root panel is hidden and stripped of input. LVGL skips a hidden subtree
+     * when it hit tests a touch, so a tap meant for the running app can never be
+     * latched by an icon underneath and fired on the way back.
+     */
+    void hide();
+
+    /** @brief Bring the parked launcher back, with its input state reset. */
+    void show();
+
+    bool isInitialized() const
+    {
+        return _panel != nullptr;
+    }
+
 private:
     std::unique_ptr<uitk::lvgl_cpp::Container> _panel;
     std::vector<std::unique_ptr<uitk::lvgl_cpp::Container>> _icon_panels;

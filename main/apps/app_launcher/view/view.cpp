@@ -365,6 +365,50 @@ void LauncherView::init(std::vector<mooncake::AppProps_t> appPorps)
     GetHAL().bootLogo.reset();
 }
 
+void LauncherView::hide()
+{
+    if (!_panel) {
+        return;
+    }
+
+    // Hiding the root is what actually blocks input: lv_indev_search_obj() bails out
+    // on LV_OBJ_FLAG_HIDDEN before it ever descends into the icons. Clearing the two
+    // interaction flags on top of that is free - neither add_flag nor remove_flag
+    // touches the scroll position, they only invalidate the scrollbar area.
+    _panel->addFlag(LV_OBJ_FLAG_HIDDEN);
+    _panel->removeFlag(LV_OBJ_FLAG_CLICKABLE);
+    _panel->removeFlag(LV_OBJ_FLAG_SCROLLABLE);
+
+    // Drop a click that was queued but not yet dispatched, so it cannot open an app
+    // the moment the launcher comes back.
+    _clicked_app_id = -1;
+
+    // Stop owning the keys while the app in front is using them.
+    _key_manager.reset();
+}
+
+void LauncherView::show()
+{
+    if (!_panel) {
+        return;
+    }
+
+    _panel->addFlag(LV_OBJ_FLAG_SCROLLABLE);
+    _panel->addFlag(LV_OBJ_FLAG_CLICKABLE);
+    _panel->removeFlag(LV_OBJ_FLAG_HIDDEN);
+
+    // A rebuilt launcher used to end up as the newest child of the screen. Keep that
+    // exact z-order; the status bar is created after this call so it still lands above.
+    _panel->moveForeground();
+
+    // The key manager slept through the whole app session, so the last button state it
+    // saw is stale - notably the A+B hold that closed the app. A fresh one starts from
+    // the same blank state the rebuilt launcher used to get.
+    _key_manager    = std::make_unique<input::KeyManager>();
+    _clicked_app_id = -1;
+    _state          = STATE_NORMAL;
+}
+
 void LauncherView::update()
 {
     if (_key_manager) {
@@ -400,7 +444,13 @@ void LauncherView::scroll_to_nearby_icon(int direction)
 
     int target_x        = target_index * _icon_gap;
     int scroll_distance = target_x - current_scroll_x;
-    _panel->scrollBy(-scroll_distance, 0, LV_ANIM_ON);
+
+    // LVGL prices this animation at lv_anim_speed_clamped(466 >> 1, 200, 400), which for
+    // a one-icon 466px hop always saturates at the 400ms ceiling. That fixed 400ms is the
+    // whole cost of an arrow tap or a key press, so the explicit "go to the next icon"
+    // command lands immediately instead. Finger drags are untouched and keep their
+    // native momentum and snap animation.
+    _panel->scrollBy(-scroll_distance, 0, LV_ANIM_OFF);
 }
 
 void LauncherView::handle_state_startup()

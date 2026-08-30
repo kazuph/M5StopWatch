@@ -107,6 +107,14 @@ void Hal::ioe_tp_reset()
 
 void Hal::ioe_speaker_enable(bool enable)
 {
+    static bool initialized = false;
+    static bool enabled     = false;
+    if (initialized && enabled == enable) {
+        return;
+    }
+    initialized = true;
+    enabled     = enable;
+
     mclog::tagInfo(_tag, "set speaker {}", enable ? "enable" : "disable");
 
     if (enable) {

@@ -32,11 +32,15 @@ void Hal::button_init()
     getButtonConfig(true);
 }
 
-void Hal::updateButtonStates()
+void Hal::updateButtonStates(bool feedback)
 {
     btnA.setRawState(millis(), !gpio_get_level(USER_BUTTONA_PIN));
     btnB.setRawState(millis(), !gpio_get_level(USER_BUTTONB_PIN));
     // btnPwr.setRawState(millis(), pmic_get_pwr_btn_state());
+
+    if (!feedback) {
+        return;
+    }
 
     auto& config = getButtonConfig();
     if (btnA.wasPressed()) {

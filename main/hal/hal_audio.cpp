@@ -6,6 +6,7 @@
 #include "hal.h"
 #include "utils/settings/settings.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <memory>
 #include <mooncake_log.h>
@@ -19,65 +20,85 @@
 
 static const std::string_view _tag = "HAL-Audio";
 
-#define I2S_PORT         I2S_NUM_0
 #define I2S_MCLK_PIN     (gpio_num_t)18
 #define I2S_BCLK_PIN     (gpio_num_t)17
 #define I2S_DADC_IN_PIN  (gpio_num_t)16
 #define I2S_LRCK_PIN     (gpio_num_t)15
 #define I2S_DDAC_OUT_PIN (gpio_num_t)21
 
+struct AudioInputModeConfig {
+    i2s_port_t port;
+    i2s_std_slot_mask_t slot;
+    bool rawRead;
+    const char* name;
+};
+
+constexpr std::array<AudioInputModeConfig, static_cast<std::size_t>(Hal::AudioInputMode::Count)> _input_modes = {{
+    {I2S_NUM_1, I2S_STD_SLOT_LEFT, false, "I2S1 LEFT"},
+    {I2S_NUM_1, I2S_STD_SLOT_RIGHT, false, "I2S1 RIGHT"},
+    {I2S_NUM_1, I2S_STD_SLOT_LEFT, true, "RAW1 LEFT"},
+    {I2S_NUM_1, I2S_STD_SLOT_RIGHT, true, "RAW1 RIGHT"},
+    {I2S_NUM_0, I2S_STD_SLOT_LEFT, true, "RAW0 LEFT"},
+    {I2S_NUM_0, I2S_STD_SLOT_RIGHT, true, "RAW0 RIGHT"},
+}};
+
 static class AudioCodec {
 public:
-    static constexpr int sample_rate       = 44100;
-    static constexpr int spectrum_fft_size = 512;
-    static constexpr int spectrum_hop_size = 256;
+    static constexpr int playback_sample_rate = 44100;
+    static constexpr int record_sample_rate   = 16000;
+    static constexpr int spectrum_fft_size    = 512;
+    static constexpr int spectrum_hop_size    = 256;
 
     void init(i2c_master_bus_handle_t i2c_bus)
     {
-        _silence_buffer.resize(sample_rate * 0.1);
+        _silence_buffer.resize(playback_sample_rate / 10);
         _silence_buffer.assign(_silence_buffer.size(), 0);
         _spectrum_init();
         xTaskCreate([](void* obj) { static_cast<AudioCodec*>(obj)->_task_entry(); }, "audio_task", 4 * 1024, this, 5,
                     &_task_handle);
 
-        _i2s_init();
+        audio_codec_i2c_cfg_t i2c_cfg = {};
+        i2c_cfg.addr                  = ES8311_CODEC_DEFAULT_ADDR;
+        i2c_cfg.bus_handle            = i2c_bus;
+        _input_ctrl_if                = audio_codec_new_i2c_ctrl(&i2c_cfg);
+        _output_ctrl_if               = audio_codec_new_i2c_ctrl(&i2c_cfg);
+        _input_gpio_if                = audio_codec_new_gpio();
+        _output_gpio_if               = audio_codec_new_gpio();
 
-        audio_codec_i2s_cfg_t i2s_cfg = {
-            .rx_handle = _rx_handle,
-            .tx_handle = _tx_handle,
-        };
-        _data_if = audio_codec_new_i2s_data(&i2s_cfg);
+        es8311_codec_cfg_t input_codec_cfg = {};
+        input_codec_cfg.ctrl_if            = _input_ctrl_if;
+        input_codec_cfg.gpio_if            = _input_gpio_if;
+        input_codec_cfg.codec_mode         = ESP_CODEC_DEV_WORK_MODE_ADC;
+        input_codec_cfg.pa_pin             = GPIO_NUM_NC;
+        input_codec_cfg.use_mclk           = true;
+        _input_codec_if                    = es8311_codec_new(&input_codec_cfg);
 
-        audio_codec_i2c_cfg_t i2c_cfg = {.addr = ES8311_CODEC_DEFAULT_ADDR, .bus_handle = i2c_bus};
-        _ctrl_if                      = audio_codec_new_i2c_ctrl(&i2c_cfg);
+        es8311_codec_cfg_t output_codec_cfg        = {};
+        output_codec_cfg.ctrl_if                   = _output_ctrl_if;
+        output_codec_cfg.gpio_if                   = _output_gpio_if;
+        output_codec_cfg.codec_mode                = ESP_CODEC_DEV_WORK_MODE_DAC;
+        output_codec_cfg.pa_pin                    = GPIO_NUM_NC;
+        output_codec_cfg.use_mclk                  = true;
+        output_codec_cfg.hw_gain.pa_voltage        = 5.0f;
+        output_codec_cfg.hw_gain.codec_dac_voltage = 3.3f;
+        _output_codec_if                           = es8311_codec_new(&output_codec_cfg);
 
-        _gpio_if = audio_codec_new_gpio();
+        audio_codec_i2c_cfg_t duplex_i2c_cfg       = {};
+        duplex_i2c_cfg.addr                        = ES8311_CODEC_DEFAULT_ADDR;
+        duplex_i2c_cfg.bus_handle                  = i2c_bus;
+        _duplex_ctrl_if                            = audio_codec_new_i2c_ctrl(&duplex_i2c_cfg);
+        _duplex_gpio_if                            = audio_codec_new_gpio();
+        es8311_codec_cfg_t duplex_codec_cfg        = {};
+        duplex_codec_cfg.ctrl_if                   = _duplex_ctrl_if;
+        duplex_codec_cfg.gpio_if                   = _duplex_gpio_if;
+        duplex_codec_cfg.codec_mode                = ESP_CODEC_DEV_WORK_MODE_BOTH;
+        duplex_codec_cfg.pa_pin                    = GPIO_NUM_NC;
+        duplex_codec_cfg.use_mclk                  = true;
+        duplex_codec_cfg.hw_gain.pa_voltage        = 5.0f;
+        duplex_codec_cfg.hw_gain.codec_dac_voltage = 3.3f;
+        _duplex_codec_if                           = es8311_codec_new(&duplex_codec_cfg);
 
-        es8311_codec_cfg_t es8311_cfg = {
-            .ctrl_if     = _ctrl_if,
-            .gpio_if     = _gpio_if,
-            .codec_mode  = ESP_CODEC_DEV_WORK_MODE_BOTH,
-            .pa_pin      = GPIO_NUM_NC,
-            .pa_reverted = false,
-            .use_mclk    = true,
-        };
-        _codec_if = es8311_codec_new(&es8311_cfg);
-
-        esp_codec_dev_cfg_t dev_cfg = {
-            .dev_type = ESP_CODEC_DEV_TYPE_IN_OUT,
-            .codec_if = _codec_if,
-            .data_if  = _data_if,
-        };
-        _codec_dev = esp_codec_dev_new(&dev_cfg);
-
-        esp_codec_dev_set_in_gain(_codec_dev, 30.0);
-
-        esp_codec_dev_sample_info_t fs = {
-            .bits_per_sample = 16,
-            .channel         = 1,
-            .sample_rate     = sample_rate,
-        };
-        esp_codec_dev_open(_codec_dev, &fs);
+        _select_mode_locked(Mode::Playback);
     }
 
     void updateSpectrum(Hal::AudioSpectrumFrame& frame)
@@ -100,26 +121,62 @@ public:
     void setVolume(int volume)
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        esp_codec_dev_set_out_vol(_codec_dev, volume);
+        _volume = volume;
+        if (_output_dev != nullptr) {
+            esp_codec_dev_set_out_vol(_output_dev, volume);
+        }
+        if (_duplex_dev != nullptr) {
+            esp_codec_dev_set_out_vol(_duplex_dev, volume);
+        }
     }
 
     int getVolume()
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        int volume = 0;
-        esp_codec_dev_get_out_vol(_codec_dev, &volume);
-        return volume;
+        return _volume;
     }
 
     void setMicGain(float gain)
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        esp_codec_dev_set_in_gain(_codec_dev, gain);
+        _mic_gain = gain;
+        if (_input_dev != nullptr) {
+            esp_codec_dev_set_in_gain(_input_dev, gain);
+        }
+        if (_duplex_dev != nullptr) {
+            esp_codec_dev_set_in_gain(_duplex_dev, gain);
+        }
+    }
+
+    void setInputMode(Hal::AudioInputMode mode)
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (mode == Hal::AudioInputMode::Count || mode == _input_mode) {
+            return;
+        }
+        _input_mode = mode;
+        if (_mode == Mode::Record) {
+            _destroy_active_path_locked();
+        }
+        mclog::tagInfo(_tag, "audio input mode: {}", inputModeName());
+    }
+
+    Hal::AudioInputMode inputMode() const
+    {
+        return _input_mode;
+    }
+
+    const char* inputModeName() const
+    {
+        return _input_modes[static_cast<std::size_t>(_input_mode)].name;
     }
 
     void play(std::vector<int16_t>& data, bool async)
     {
         std::lock_guard<std::mutex> lock(_mutex);
+        if (!_select_mode_locked(Mode::Playback)) {
+            return;
+        }
         if (async) {
             // Support interruption: overwrite data and notify task
             _audio_data = data;
@@ -137,22 +194,388 @@ public:
     void record(std::vector<int16_t>& data, uint16_t durationMs, float gain)
     {
         std::lock_guard<std::mutex> lock(_mutex);
+        if (!_select_mode_locked(Mode::Record)) {
+            data.clear();
+            return;
+        }
 
-        esp_codec_dev_set_in_gain(_codec_dev, gain);
+        _mic_gain = gain;
+        esp_codec_dev_set_in_gain(_input_dev, gain);
 
-        size_t sample_count = (size_t)(sample_rate * durationMs / 1000);
+        size_t sample_count = (size_t)(record_sample_rate * durationMs / 1000);
         size_t byte_size    = sample_count * sizeof(int16_t);
 
         data.resize(sample_count);
 
-        esp_err_t ret = esp_codec_dev_read(_codec_dev, data.data(), byte_size);
+        esp_err_t ret = _read_input_locked(data.data(), byte_size);
         if (ret != ESP_OK) {
             mclog::tagError(_tag, "record failed: {}", ret);
             data.clear();
         }
     }
 
+    void streamWrite(const std::vector<int16_t>& data)
+    {
+        if (data.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(_mutex);
+        const int result = _write_mono_locked(data);
+        if (result == ESP_CODEC_DEV_OK) {
+            _stream_written_frames.fetch_add(1);
+        } else {
+            _stream_failed_frames.fetch_add(1);
+            _stream_last_error.store(result);
+        }
+    }
+
+    bool startDuplex()
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_duplex_active.load()) {
+            return true;
+        }
+        if (!_select_mode_locked(Mode::Duplex)) {
+            return false;
+        }
+        _duplex_active.store(true);
+        return true;
+    }
+
+    void stopDuplex()
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_mode == Mode::Duplex) {
+            _select_mode_locked(Mode::Playback);
+        }
+    }
+
+    void duplexRecord(std::vector<int16_t>& data, uint16_t durationMs, float gain)
+    {
+        (void)gain;
+        std::lock_guard<std::mutex> lock(_input_io_mutex);
+        if (!_duplex_active.load() || _duplex_dev == nullptr) {
+            data.clear();
+            return;
+        }
+
+        const std::size_t sample_count = static_cast<std::size_t>(record_sample_rate) * durationMs / 1000;
+        _duplex_input_buffer.resize(sample_count * 2);
+        const int result =
+            esp_codec_dev_read(_duplex_dev, _duplex_input_buffer.data(), _duplex_input_buffer.size() * sizeof(int16_t));
+        if (result != ESP_CODEC_DEV_OK) {
+            data.clear();
+            return;
+        }
+        data.resize(sample_count);
+        for (std::size_t i = 0; i < sample_count; ++i) {
+            data[i] = _duplex_input_buffer[i * 2];
+        }
+    }
+
+    void duplexStreamWrite(const std::vector<int16_t>& data)
+    {
+        if (data.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(_output_io_mutex);
+        if (!_duplex_active.load() || _duplex_dev == nullptr) {
+            return;
+        }
+        _duplex_output_buffer.resize(data.size() * 2);
+        for (std::size_t i = 0; i < data.size(); ++i) {
+            _duplex_output_buffer[i * 2]     = data[i];
+            _duplex_output_buffer[i * 2 + 1] = data[i];
+        }
+        const int result = esp_codec_dev_write(_duplex_dev, _duplex_output_buffer.data(),
+                                               _duplex_output_buffer.size() * sizeof(int16_t));
+        if (result == ESP_CODEC_DEV_OK) {
+            _stream_written_frames.fetch_add(1);
+        } else {
+            _stream_failed_frames.fetch_add(1);
+            _stream_last_error.store(result);
+        }
+    }
+
+    Hal::AudioStreamStats streamStats() const
+    {
+        return {
+            .writtenFrames = _stream_written_frames.load(),
+            .failedFrames  = _stream_failed_frames.load(),
+            .lastError     = _stream_last_error.load(),
+        };
+    }
+
+    bool preparePlayback()
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        return _select_mode_locked(Mode::Playback);
+    }
+
+    std::array<uint8_t, Hal::AudioSpectrumFrame::bandCount> analyzePacket(const std::vector<int16_t>& data)
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        std::array<uint8_t, Hal::AudioSpectrumFrame::bandCount> quantized = {};
+        if (data.empty()) {
+            return quantized;
+        }
+
+        _spectrum_time_domain.fill(0.0f);
+        const std::size_t sample_count = std::min<std::size_t>(data.size(), spectrum_fft_size);
+        const std::size_t offset       = spectrum_fft_size - sample_count;
+        for (std::size_t i = 0; i < sample_count; ++i) {
+            _spectrum_time_domain[offset + i] = static_cast<float>(data[data.size() - sample_count + i]) / 32768.0f;
+        }
+
+        Hal::AudioSpectrumFrame frame;
+        _process_spectrum_frame(frame);
+        for (std::size_t i = 0; i < frame.bandCount; ++i) {
+            quantized[i] = static_cast<uint8_t>(std::lround(std::clamp(frame.bands[i], 0.0f, 1.0f) * 255.0f));
+        }
+        return quantized;
+    }
+
 private:
+    enum class Mode {
+        None,
+        Record,
+        Playback,
+        Duplex,
+    };
+
+    bool _select_mode_locked(Mode target)
+    {
+        if (_mode == target) {
+            return true;
+        }
+
+        std::unique_lock<std::mutex> input_lock(_input_io_mutex, std::defer_lock);
+        std::unique_lock<std::mutex> output_lock(_output_io_mutex, std::defer_lock);
+        if (_duplex_active.exchange(false)) {
+            std::lock(input_lock, output_lock);
+        }
+        _destroy_active_path_locked();
+
+        int result = ESP_CODEC_DEV_OK;
+        if (target == Mode::Playback) {
+            if (!_create_playback_path_locked()) {
+                return false;
+            }
+            result = esp_codec_dev_open(_output_dev, &_output_format);
+            if (result == ESP_CODEC_DEV_OK) {
+                esp_codec_dev_set_out_vol(_output_dev, _volume);
+            }
+        } else if (target == Mode::Record) {
+            if (!_create_record_path_locked()) {
+                return false;
+            }
+            result = esp_codec_dev_open(_input_dev, &_input_format);
+            if (result == ESP_CODEC_DEV_OK) {
+                esp_codec_dev_set_in_gain(_input_dev, _mic_gain);
+            }
+        } else if (target == Mode::Duplex) {
+            if (!_create_duplex_path_locked()) {
+                return false;
+            }
+            result = esp_codec_dev_open(_duplex_dev, &_duplex_format);
+            if (result == ESP_CODEC_DEV_OK) {
+                esp_codec_dev_set_out_vol(_duplex_dev, _volume);
+                esp_codec_dev_set_in_gain(_duplex_dev, _mic_gain);
+            }
+        }
+
+        if (result != ESP_CODEC_DEV_OK) {
+            mclog::tagError(_tag, "audio mode switch failed: target={}, error={}", static_cast<int>(target), result);
+            return false;
+        }
+        _mode = target;
+        if (target == Mode::Playback) {
+            mclog::tagInfo(_tag, "audio path: playback, i2s=0, rate={}, channels=stereo", playback_sample_rate);
+        } else if (target == Mode::Record) {
+            mclog::tagInfo(_tag, "audio path: record, i2s=1, rate={}, channel=right", record_sample_rate);
+        } else if (target == Mode::Duplex) {
+            mclog::tagInfo(_tag, "audio path: duplex, i2s=0, rate={}, channels=stereo", record_sample_rate);
+        }
+        return true;
+    }
+
+    void _destroy_active_path_locked()
+    {
+        if (_duplex_dev != nullptr) {
+            esp_codec_dev_close(_duplex_dev);
+            esp_codec_dev_delete(_duplex_dev);
+            _duplex_dev = nullptr;
+        }
+        if (_output_dev != nullptr) {
+            esp_codec_dev_close(_output_dev);
+            esp_codec_dev_delete(_output_dev);
+            _output_dev = nullptr;
+        }
+        if (_input_dev != nullptr) {
+            esp_codec_dev_close(_input_dev);
+            esp_codec_dev_delete(_input_dev);
+            _input_dev = nullptr;
+        }
+        if (_output_data_if != nullptr) {
+            audio_codec_delete_data_if(_output_data_if);
+            _output_data_if = nullptr;
+        }
+        if (_input_data_if != nullptr) {
+            audio_codec_delete_data_if(_input_data_if);
+            _input_data_if = nullptr;
+        }
+        if (_duplex_data_if != nullptr) {
+            audio_codec_delete_data_if(_duplex_data_if);
+            _duplex_data_if = nullptr;
+        }
+        if (_tx_handle != nullptr) {
+            i2s_del_channel(_tx_handle);
+            _tx_handle = nullptr;
+        }
+        if (_rx_handle != nullptr) {
+            i2s_del_channel(_rx_handle);
+            _rx_handle = nullptr;
+        }
+        _mode = Mode::None;
+    }
+
+    bool _create_duplex_path_locked()
+    {
+        i2s_chan_config_t channel_config = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+        channel_config.auto_clear        = true;
+        if (i2s_new_channel(&channel_config, &_tx_handle, &_rx_handle) != ESP_OK) {
+            return false;
+        }
+
+        i2s_std_config_t config = {};
+        config.clk_cfg          = I2S_STD_CLK_DEFAULT_CONFIG(record_sample_rate);
+        config.slot_cfg         = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
+        config.gpio_cfg.mclk    = I2S_MCLK_PIN;
+        config.gpio_cfg.bclk    = I2S_BCLK_PIN;
+        config.gpio_cfg.ws      = I2S_LRCK_PIN;
+        config.gpio_cfg.dout    = I2S_DDAC_OUT_PIN;
+        config.gpio_cfg.din     = I2S_DADC_IN_PIN;
+        if (i2s_channel_init_std_mode(_tx_handle, &config) != ESP_OK ||
+            i2s_channel_init_std_mode(_rx_handle, &config) != ESP_OK) {
+            i2s_del_channel(_tx_handle);
+            i2s_del_channel(_rx_handle);
+            _tx_handle = nullptr;
+            _rx_handle = nullptr;
+            return false;
+        }
+
+        audio_codec_i2s_cfg_t data_config = {};
+        data_config.port                  = I2S_NUM_0;
+        data_config.tx_handle             = _tx_handle;
+        data_config.rx_handle             = _rx_handle;
+        _duplex_data_if                   = audio_codec_new_i2s_data(&data_config);
+        esp_codec_dev_cfg_t device_config = {
+            .dev_type = ESP_CODEC_DEV_TYPE_IN_OUT,
+            .codec_if = _duplex_codec_if,
+            .data_if  = _duplex_data_if,
+        };
+        _duplex_dev = esp_codec_dev_new(&device_config);
+        return _duplex_data_if != nullptr && _duplex_dev != nullptr;
+    }
+
+    bool _create_playback_path_locked()
+    {
+        i2s_chan_config_t channel_config = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+        channel_config.auto_clear        = true;
+        if (i2s_new_channel(&channel_config, &_tx_handle, nullptr) != ESP_OK) {
+            return false;
+        }
+
+        i2s_std_config_t config = {};
+        config.clk_cfg          = I2S_STD_CLK_DEFAULT_CONFIG(playback_sample_rate);
+        config.slot_cfg         = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
+        config.gpio_cfg.mclk    = I2S_MCLK_PIN;
+        config.gpio_cfg.bclk    = I2S_BCLK_PIN;
+        config.gpio_cfg.ws      = I2S_LRCK_PIN;
+        config.gpio_cfg.dout    = I2S_DDAC_OUT_PIN;
+        config.gpio_cfg.din     = GPIO_NUM_NC;
+        if (i2s_channel_init_std_mode(_tx_handle, &config) != ESP_OK) {
+            i2s_del_channel(_tx_handle);
+            _tx_handle = nullptr;
+            return false;
+        }
+
+        audio_codec_i2s_cfg_t data_config = {};
+        data_config.port                  = I2S_NUM_0;
+        data_config.tx_handle             = _tx_handle;
+        _output_data_if                   = audio_codec_new_i2s_data(&data_config);
+        esp_codec_dev_cfg_t device_config = {
+            .dev_type = ESP_CODEC_DEV_TYPE_OUT,
+            .codec_if = _output_codec_if,
+            .data_if  = _output_data_if,
+        };
+        _output_dev = esp_codec_dev_new(&device_config);
+        return _output_data_if != nullptr && _output_dev != nullptr;
+    }
+
+    bool _create_record_path_locked()
+    {
+        const auto& input_config         = _input_modes[static_cast<std::size_t>(_input_mode)];
+        i2s_chan_config_t channel_config = I2S_CHANNEL_DEFAULT_CONFIG(input_config.port, I2S_ROLE_MASTER);
+        if (i2s_new_channel(&channel_config, nullptr, &_rx_handle) != ESP_OK) {
+            return false;
+        }
+
+        i2s_std_config_t config   = {};
+        config.clk_cfg            = I2S_STD_CLK_DEFAULT_CONFIG(record_sample_rate);
+        config.slot_cfg           = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+        config.slot_cfg.slot_mask = input_config.slot;
+        config.gpio_cfg.mclk      = I2S_MCLK_PIN;
+        config.gpio_cfg.bclk      = I2S_BCLK_PIN;
+        config.gpio_cfg.ws        = I2S_LRCK_PIN;
+        config.gpio_cfg.dout      = GPIO_NUM_NC;
+        config.gpio_cfg.din       = I2S_DADC_IN_PIN;
+        if (i2s_channel_init_std_mode(_rx_handle, &config) != ESP_OK) {
+            i2s_del_channel(_rx_handle);
+            _rx_handle = nullptr;
+            return false;
+        }
+
+        audio_codec_i2s_cfg_t data_config = {};
+        data_config.port                  = input_config.port;
+        data_config.rx_handle             = _rx_handle;
+        _input_data_if                    = audio_codec_new_i2s_data(&data_config);
+        esp_codec_dev_cfg_t device_config = {
+            .dev_type = ESP_CODEC_DEV_TYPE_IN,
+            .codec_if = _input_codec_if,
+            .data_if  = _input_data_if,
+        };
+        _input_dev                 = esp_codec_dev_new(&device_config);
+        _input_format.channel_mask = input_config.slot == I2S_STD_SLOT_LEFT ? ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0)
+                                                                            : ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1);
+        return _input_data_if != nullptr && _input_dev != nullptr;
+    }
+
+    esp_err_t _read_input_locked(int16_t* data, std::size_t byteSize)
+    {
+        const auto& input_config = _input_modes[static_cast<std::size_t>(_input_mode)];
+        if (!input_config.rawRead) {
+            return esp_codec_dev_read(_input_dev, data, byteSize);
+        }
+
+        std::size_t bytes_read = 0;
+        const esp_err_t result = i2s_channel_read(_rx_handle, data, byteSize, &bytes_read, portMAX_DELAY);
+        return result == ESP_OK && bytes_read == byteSize ? ESP_OK : ESP_FAIL;
+    }
+
+    int _write_mono_locked(const std::vector<int16_t>& mono)
+    {
+        if (!_select_mode_locked(Mode::Playback)) {
+            return ESP_CODEC_DEV_WRONG_STATE;
+        }
+        _stereo_buffer.resize(mono.size() * 2);
+        for (std::size_t i = 0; i < mono.size(); ++i) {
+            _stereo_buffer[i * 2]     = mono[i];
+            _stereo_buffer[i * 2 + 1] = mono[i];
+        }
+        return esp_codec_dev_write(_output_dev, _stereo_buffer.data(), _stereo_buffer.size() * sizeof(int16_t));
+    }
+
     void _task_entry()
     {
         mclog::tagInfo(_tag, "start audio play task");
@@ -163,15 +586,15 @@ private:
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
             while (true) {
-                // Fetch data safely
                 {
                     std::lock_guard<std::mutex> lock(_mutex);
-                    if (_audio_data.empty()) {
+                    if (!_audio_data.empty()) {
+                        current_data = std::move(_audio_data);
+                        _audio_data.clear();
+                    } else {
                         _is_playing = false;
                         break;
                     }
-                    current_data = _audio_data;
-                    _audio_data.clear();
                     _is_playing = true;
                 }
 
@@ -196,53 +619,38 @@ private:
                     size_t remain        = total_samples - offset;
                     size_t write_samples = (remain > CHUNK_SAMPLES) ? CHUNK_SAMPLES : remain;
 
-                    esp_codec_dev_write(_codec_dev, (void*)&current_data[offset], write_samples * sizeof(int16_t));
+                    std::vector<int16_t> chunk(current_data.begin() + offset,
+                                               current_data.begin() + offset + write_samples);
+                    {
+                        std::lock_guard<std::mutex> lock(_mutex);
+                        _write_mono_locked(chunk);
+                    }
                     offset += write_samples;
                 }
 
                 if (interrupted) {
                     // Stop current playback immediately and flush DMA
-                    i2s_channel_disable(_tx_handle);
-                    i2s_channel_enable(_tx_handle);
+                    std::lock_guard<std::mutex> lock(_mutex);
+                    if (_mode == Mode::Playback) {
+                        i2s_channel_disable(_tx_handle);
+                        i2s_channel_enable(_tx_handle);
+                    }
                     continue;
                 }
 
                 // Normal finish, play silence to avoid pop/waiting
-                esp_codec_dev_write(_codec_dev, (void*)_silence_buffer.data(),
-                                    _silence_buffer.size() * sizeof(int16_t));
+                {
+                    std::lock_guard<std::mutex> lock(_mutex);
+                    _write_mono_locked(_silence_buffer);
+                }
             }
         }
     }
 
     void _write(const std::vector<int16_t>& data)
     {
-        esp_codec_dev_write(_codec_dev, (void*)data.data(), data.size() * sizeof(int16_t));
-        esp_codec_dev_write(_codec_dev, (void*)_silence_buffer.data(), _silence_buffer.size() * sizeof(int16_t));
-    }
-
-    void _i2s_init()
-    {
-        mclog::tagInfo(_tag, "i2s init");
-
-        i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT, I2S_ROLE_MASTER);
-        i2s_std_config_t std_cfg   = {
-            .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
-            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-            .gpio_cfg =
-                {
-                    .mclk = I2S_MCLK_PIN,
-                    .bclk = I2S_BCLK_PIN,
-                    .ws   = I2S_LRCK_PIN,
-                    .dout = I2S_DDAC_OUT_PIN,
-                    .din  = I2S_DADC_IN_PIN,
-                },
-        };
-
-        ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &_tx_handle, &_rx_handle));
-        ESP_ERROR_CHECK(i2s_channel_init_std_mode(_tx_handle, &std_cfg));
-        ESP_ERROR_CHECK(i2s_channel_init_std_mode(_rx_handle, &std_cfg));
-        ESP_ERROR_CHECK(i2s_channel_enable(_tx_handle));
-        ESP_ERROR_CHECK(i2s_channel_enable(_rx_handle));
+        _write_mono_locked(data);
+        _write_mono_locked(_silence_buffer);
     }
 
     void _spectrum_init()
@@ -256,8 +664,8 @@ private:
         dsps_wind_hann_f32(_spectrum_window.data(), spectrum_fft_size);
 
         constexpr int max_bin = spectrum_fft_size / 2;
-        const float nyquist   = static_cast<float>(sample_rate) * 0.5f;
-        const float min_hz    = static_cast<float>(sample_rate) / static_cast<float>(spectrum_fft_size);
+        const float nyquist   = static_cast<float>(record_sample_rate) * 0.5f;
+        const float min_hz    = static_cast<float>(record_sample_rate) / static_cast<float>(spectrum_fft_size);
         const float log_min   = std::log10(min_hz);
         const float log_max   = std::log10(nyquist);
 
@@ -265,7 +673,7 @@ private:
         for (std::size_t i = 1; i < Hal::AudioSpectrumFrame::bandCount; ++i) {
             float t            = static_cast<float>(i) / static_cast<float>(Hal::AudioSpectrumFrame::bandCount);
             float edge_hz      = std::pow(10.0f, log_min + (log_max - log_min) * t);
-            int edge_bin       = static_cast<int>(std::lround(edge_hz * spectrum_fft_size / sample_rate));
+            int edge_bin       = static_cast<int>(std::lround(edge_hz * spectrum_fft_size / record_sample_rate));
             int min_edge       = _band_bin_edges[i - 1] + 1;
             int max_edge       = max_bin - static_cast<int>(Hal::AudioSpectrumFrame::bandCount - i);
             _band_bin_edges[i] = std::clamp(edge_bin, min_edge, max_edge);
@@ -281,7 +689,10 @@ private:
             return false;
         }
 
-        esp_err_t ret = esp_codec_dev_read(_codec_dev, _spectrum_pcm_hop.data(), sizeof(int16_t) * spectrum_hop_size);
+        if (!_select_mode_locked(Mode::Record)) {
+            return false;
+        }
+        esp_err_t ret = _read_input_locked(_spectrum_pcm_hop.data(), sizeof(int16_t) * spectrum_hop_size);
         if (ret != ESP_OK) {
             return false;
         }
@@ -391,7 +802,7 @@ private:
                 }
             }
             frame.peakFrequencyHz =
-                refined_bin * static_cast<float>(sample_rate) / static_cast<float>(spectrum_fft_size);
+                refined_bin * static_cast<float>(record_sample_rate) / static_cast<float>(spectrum_fft_size);
         } else {
             frame.peakFrequencyHz = 0.0f;
         }
@@ -409,17 +820,58 @@ private:
         }
     }
 
-    i2s_chan_handle_t _tx_handle          = NULL;
-    i2s_chan_handle_t _rx_handle          = NULL;
-    esp_codec_dev_handle_t _codec_dev     = NULL;
-    const audio_codec_data_if_t* _data_if = NULL;
-    const audio_codec_ctrl_if_t* _ctrl_if = NULL;
-    const audio_codec_gpio_if_t* _gpio_if = NULL;
-    const audio_codec_if_t* _codec_if     = NULL;
+    i2s_chan_handle_t _tx_handle = nullptr;
+    i2s_chan_handle_t _rx_handle = nullptr;
+
+    esp_codec_dev_sample_info_t _input_format = {
+        .bits_per_sample = 16,
+        .channel         = 2,
+        .channel_mask    = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1),
+        .sample_rate     = record_sample_rate,
+        .mclk_multiple   = 0,
+    };
+    esp_codec_dev_sample_info_t _output_format = {
+        .bits_per_sample = 16,
+        .channel         = 2,
+        .channel_mask    = 0,
+        .sample_rate     = playback_sample_rate,
+        .mclk_multiple   = 0,
+    };
+    esp_codec_dev_sample_info_t _duplex_format = {
+        .bits_per_sample = 16,
+        .channel         = 2,
+        .channel_mask    = 0,
+        .sample_rate     = record_sample_rate,
+        .mclk_multiple   = 0,
+    };
+    esp_codec_dev_handle_t _input_dev            = NULL;
+    esp_codec_dev_handle_t _output_dev           = NULL;
+    esp_codec_dev_handle_t _duplex_dev           = NULL;
+    const audio_codec_data_if_t* _input_data_if  = NULL;
+    const audio_codec_data_if_t* _output_data_if = NULL;
+    const audio_codec_data_if_t* _duplex_data_if = NULL;
+    const audio_codec_ctrl_if_t* _input_ctrl_if  = NULL;
+    const audio_codec_ctrl_if_t* _output_ctrl_if = NULL;
+    const audio_codec_gpio_if_t* _input_gpio_if  = NULL;
+    const audio_codec_gpio_if_t* _output_gpio_if = NULL;
+    const audio_codec_if_t* _input_codec_if      = NULL;
+    const audio_codec_if_t* _output_codec_if     = NULL;
+    const audio_codec_ctrl_if_t* _duplex_ctrl_if = NULL;
+    const audio_codec_gpio_if_t* _duplex_gpio_if = NULL;
+    const audio_codec_if_t* _duplex_codec_if     = NULL;
 
     TaskHandle_t _task_handle;
     std::mutex _mutex;
+    std::mutex _input_io_mutex;
+    std::mutex _output_io_mutex;
     std::vector<int16_t> _audio_data;
+    std::vector<int16_t> _stereo_buffer;
+    std::vector<int16_t> _duplex_input_buffer;
+    std::vector<int16_t> _duplex_output_buffer;
+    std::atomic<bool> _duplex_active             = false;
+    std::atomic<uint32_t> _stream_written_frames = 0;
+    std::atomic<uint32_t> _stream_failed_frames  = 0;
+    std::atomic<int> _stream_last_error          = ESP_CODEC_DEV_OK;
     std::vector<int16_t> _silence_buffer;
     std::array<int16_t, spectrum_hop_size> _spectrum_pcm_hop                       = {};
     std::array<float, spectrum_fft_size> _spectrum_time_domain                     = {};
@@ -433,6 +885,10 @@ private:
     float _spectrum_normalization_level                                            = 0.03f;
     bool _spectrum_available                                                       = false;
     bool _is_playing                                                               = false;
+    Mode _mode                                                                     = Mode::None;
+    int _volume                                                                    = 80;
+    float _mic_gain                                                                = 30.0f;
+    Hal::AudioInputMode _input_mode                                                = Hal::AudioInputMode::I2s1LeftCodec;
 } _audio_codec;
 
 void Hal::audio_init()
@@ -478,21 +934,90 @@ int Hal::getSpeakerVolume(bool loadFromSettings)
 
 void Hal::audioRecord(std::vector<int16_t>& data, uint16_t durationMs, float gain)
 {
+    ioe_speaker_enable(false);
     _audio_codec.record(data, durationMs, gain);
 }
 
 void Hal::audioPlay(std::vector<int16_t>& data, bool async)
 {
     _audio_codec.play(data, async);
+    ioe_speaker_enable(true);
+}
+
+void Hal::audioStreamWrite(const std::vector<int16_t>& data)
+{
+    _audio_codec.streamWrite(data);
+}
+
+bool Hal::audioDuplexStart()
+{
+    const bool started = _audio_codec.startDuplex();
+    if (started) {
+        ioe_speaker_enable(true);
+    }
+    return started;
+}
+
+void Hal::audioDuplexStop()
+{
+    _audio_codec.stopDuplex();
+    ioe_speaker_enable(true);
+}
+
+void Hal::audioDuplexRecord(std::vector<int16_t>& data, uint16_t durationMs, float gain)
+{
+    _audio_codec.duplexRecord(data, durationMs, gain);
+}
+
+void Hal::audioDuplexStreamWrite(const std::vector<int16_t>& data)
+{
+    _audio_codec.duplexStreamWrite(data);
+}
+
+Hal::AudioStreamStats Hal::getAudioStreamStats()
+{
+    return _audio_codec.streamStats();
+}
+
+void Hal::setSpeakerEnabled(bool enabled)
+{
+    if (enabled) {
+        if (_audio_codec.preparePlayback()) {
+            ioe_speaker_enable(true);
+        }
+    } else {
+        ioe_speaker_enable(false);
+    }
+}
+
+void Hal::setAudioInputMode(AudioInputMode mode)
+{
+    _audio_codec.setInputMode(mode);
+}
+
+Hal::AudioInputMode Hal::getAudioInputMode() const
+{
+    return _audio_codec.inputMode();
+}
+
+const char* Hal::getAudioInputModeName() const
+{
+    return _audio_codec.inputModeName();
+}
+
+std::array<uint8_t, Hal::AudioSpectrumFrame::bandCount> Hal::audioAnalyzePacket(const std::vector<int16_t>& data)
+{
+    return _audio_codec.analyzePacket(data);
 }
 
 int Hal::getAudioSampleRate()
 {
-    return _audio_codec.sample_rate;
+    return AudioCodec::playback_sample_rate;
 }
 
 void Hal::updateAudioSpectrum()
 {
+    ioe_speaker_enable(false);
     _audio_codec.updateSpectrum(_audio_spectrum);
 }
 

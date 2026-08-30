@@ -11,6 +11,12 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FREERTOS_HZ=1000
+# Display refresh and input device read period. LVGL's own performance config
+# (components/lvgl/tests/src/lv_test_perf_conf.h) uses 16ms where the stock template
+# uses 33ms. The LVGL task already calls lv_timer_handler() on a 10ms cadence, so 33ms
+# lands on a 40ms refresh and a 40ms touch poll; 16ms lands on 20ms for both.
+CONFIG_LV_DEF_REFR_PERIOD=16
+CONFIG_LV_FONT_SOURCE_HAN_SANS_SC_16_CJK=y
 CONFIG_LV_USE_CLIB_MALLOC=y
 CONFIG_LV_USE_CLIB_STRING=y
 CONFIG_LV_USE_CLIB_SPRINTF=y

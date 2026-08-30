@@ -42,6 +42,7 @@ void Hal::init()
     audio_init();
     imu_init();
     rtc_init();
+    pedometer_init();
     button_init();
     fs_init();
 }

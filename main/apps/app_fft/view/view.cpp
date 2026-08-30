@@ -9,12 +9,10 @@
 #include <cstdio>
 #include <cmath>
 
-namespace {
-
-void spectrum_draw_event_cb(lv_event_t* e);
-
 using namespace view;
 using namespace uitk::lvgl_cpp;
+
+namespace {
 
 constexpr int _panel_size       = 466;
 constexpr int _disc_size        = 137;
@@ -38,9 +36,45 @@ constexpr int _deg_step         = 180 / static_cast<int>(FftView::band_count);
 constexpr float _view_attack_alpha  = 0.60f;
 constexpr float _view_release_alpha = 0.36f;
 constexpr float _disc_follow_alpha  = 0.40f;
+constexpr float _peak_fall_rate     = 0.012f;
+
+constexpr float _pi = 3.14159265358979323846f;
+
+// Shared column geometry for the two grid style modes.
+constexpr int _column_pitch = 17;
+constexpr int _column_x0    = -161;
+
+constexpr int _bars_baseline_y = 150;
+constexpr int _bars_width      = 12;
+constexpr int _bars_min_height = 8;
+constexpr int _bars_span       = 292;
+constexpr int _bars_cap_height = 4;
+
+constexpr int _ring_inner_radius = 94;
+constexpr int _ring_span         = 126;
+constexpr int _ring_line_width   = 9;
+
+constexpr int _wave_point_count = 61;
+constexpr float _wave_half_span = 196.0f;
+constexpr float _wave_amplitude = 120.0f;
+constexpr float _wave_step      = 0.55f;
+
+constexpr int _tunnel_inner_radius = 84;
+constexpr int _tunnel_pitch        = 7;
+
+constexpr int _matrix_rows     = 12;
+constexpr int _matrix_bottom_y = 140;
+constexpr int _matrix_top_y    = -140;
+constexpr float _matrix_dot_r  = 5.5f;
+
+constexpr int _mode_label_y = 196;
 
 constexpr std::array<int, FftView::reduced_band_count> _band_widths = {20, 8, 4, 2};
 constexpr std::array<int, 10> _rnd_array                            = {994, 285, 553, 11, 792, 707, 966, 641, 852, 827};
+
+constexpr std::array<const char*, static_cast<std::size_t>(FftView::Mode::_count)> _mode_names = {
+    "BLOOM", "BARS", "RING", "WAVE", "TUNNEL", "MATRIX",
+};
 
 float clamp_band(float value)
 {
@@ -81,6 +115,51 @@ lv_color_t mix_bar_color(int radius)
         static_cast<uint8_t>(((radius - _bar_color1_stop) * 255) / (_bar_color2_stop - _bar_color1_stop)));
 }
 
+/** @brief Same three colour stops as the petals, addressed by a 0..1 level instead of a radius. */
+lv_color_t mix_level_color(float level)
+{
+    const float t = clamp_band(level);
+    if (t < 0.5f) {
+        return lv_color_mix(lv_color_hex(_bar_color2), lv_color_hex(_bar_color1),
+                            static_cast<uint8_t>(std::lround(t * 2.0f * 255.0f)));
+    }
+
+    return lv_color_mix(lv_color_hex(_bar_color3), lv_color_hex(_bar_color2),
+                        static_cast<uint8_t>(std::lround((t - 0.5f) * 2.0f * 255.0f)));
+}
+
+void set_line_points(lv_draw_line_dsc_t& dsc, float x1, float y1, float x2, float y2)
+{
+    dsc.p1.x = static_cast<lv_value_precise_t>(x1);
+    dsc.p1.y = static_cast<lv_value_precise_t>(y1);
+    dsc.p2.x = static_cast<lv_value_precise_t>(x2);
+    dsc.p2.y = static_cast<lv_value_precise_t>(y2);
+}
+
+void fill_rect(lv_layer_t* layer, int32_t x1, int32_t y1, int32_t x2, int32_t y2, lv_color_t color, lv_opa_t opa,
+               int32_t radius)
+{
+    lv_draw_rect_dsc_t dsc;
+    lv_draw_rect_dsc_init(&dsc);
+    dsc.radius     = radius;
+    dsc.bg_color   = color;
+    dsc.bg_opa     = opa;
+    lv_area_t area = {x1, y1, x2, y2};
+    lv_draw_rect(layer, &dsc, &area);
+}
+
+void fill_dot(lv_layer_t* layer, float cx, float cy, float radius, lv_color_t color, lv_opa_t opa)
+{
+    fill_rect(layer, static_cast<int32_t>(std::lround(cx - radius)), static_cast<int32_t>(std::lround(cy - radius)),
+              static_cast<int32_t>(std::lround(cx + radius)), static_cast<int32_t>(std::lround(cy + radius)), color,
+              opa, LV_RADIUS_CIRCLE);
+}
+
+int column_x(std::size_t index)
+{
+    return _column_x0 + static_cast<int>(index) * _column_pitch;
+}
+
 }  // namespace
 
 void FftView::init(lv_obj_t* parent)
@@ -102,7 +181,7 @@ void FftView::init(lv_obj_t* parent)
     _click_mask->setBorderWidth(0);
     _click_mask->setPaddingAll(0);
     _click_mask->removeFlag(LV_OBJ_FLAG_SCROLLABLE);
-    _click_mask->onClick().connect([this]() { toggleCenterLabels(); });
+    _click_mask->onClick().connect([this]() { cycleMode(); });
 
     _spectrum_panel = std::make_unique<Container>(_panel->get());
     _spectrum_panel->align(LV_ALIGN_CENTER, 0, 0);
@@ -113,7 +192,7 @@ void FftView::init(lv_obj_t* parent)
     _spectrum_panel->setBgOpa(LV_OPA_TRANSP);
     _spectrum_panel->removeFlag(LV_OBJ_FLAG_CLICKABLE);
     _spectrum_panel->removeFlag(LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(_spectrum_panel->get(), spectrum_draw_event_cb, LV_EVENT_ALL, this);
+    lv_obj_add_event_cb(_spectrum_panel->get(), FftView::drawEventCb, LV_EVENT_ALL, this);
     lv_obj_refresh_ext_draw_size(_spectrum_panel->get());
 
     _center_disc = std::make_unique<Container>(_panel->get());
@@ -130,7 +209,7 @@ void FftView::init(lv_obj_t* parent)
     _peak_frequency_label->align(LV_ALIGN_CENTER, 0, -4);
     _peak_frequency_label->setTextFont(&lv_font_montserrat_28);
     _peak_frequency_label->setTextColor(lv_color_hex(_value_color));
-    _peak_frequency_label->setText("0.0");
+    _peak_frequency_label->setText("0");
 
     _peak_frequency_unit_label = std::make_unique<Label>(_center_disc->get());
     _peak_frequency_unit_label->align(LV_ALIGN_CENTER, 0, 24);
@@ -138,8 +217,14 @@ void FftView::init(lv_obj_t* parent)
     _peak_frequency_unit_label->setTextColor(lv_color_hex(_unit_color));
     _peak_frequency_unit_label->setText("Hz");
 
+    _mode_label = std::make_unique<Label>(_panel->get());
+    _mode_label->align(LV_ALIGN_CENTER, 0, _mode_label_y);
+    _mode_label->setTextFont(&lv_font_montserrat_20);
+    _mode_label->setTextColor(lv_color_hex(_unit_color));
+    _mode_label->setText(_mode_names[0]);
+
     _click_mask->moveForeground();
-    applyCenterLabelVisibility();
+    applyMode();
 
     invalidateSpectrum();
 }
@@ -155,21 +240,37 @@ void FftView::setPeakFrequencyHz(float frequencyHz)
     applyPeakFrequencyLabel();
 }
 
-void FftView::toggleCenterLabels()
+void FftView::cycleMode()
 {
-    _show_center_labels = !_show_center_labels;
-    applyCenterLabelVisibility();
+    _mode = static_cast<Mode>((static_cast<uint8_t>(_mode) + 1) % static_cast<uint8_t>(Mode::_count));
+    applyMode();
 }
 
-void FftView::applyCenterLabelVisibility()
+void FftView::applyMode()
 {
+    const bool readout = showsCenterReadout();
+
+    if (_center_disc) {
+        _center_disc->setHidden(!readout);
+    }
     if (_peak_frequency_label) {
-        _peak_frequency_label->setHidden(!_show_center_labels);
+        _peak_frequency_label->setHidden(!readout);
+    }
+    if (_peak_frequency_unit_label) {
+        _peak_frequency_unit_label->setHidden(!readout);
+    }
+    if (_mode_label) {
+        _mode_label->setText(_mode_names[static_cast<std::size_t>(_mode)]);
+        _mode_label->align(LV_ALIGN_CENTER, 0, _mode_label_y);
     }
 
-    if (_peak_frequency_unit_label) {
-        _peak_frequency_unit_label->setHidden(!_show_center_labels);
-    }
+    invalidateSpectrum();
+}
+
+bool FftView::showsCenterReadout() const
+{
+    // Only the modes that leave the middle of the screen empty can carry the read-out.
+    return _mode == Mode::Bloom || _mode == Mode::Ring || _mode == Mode::Tunnel;
 }
 
 void FftView::update()
@@ -190,17 +291,24 @@ void FftView::update()
     }
 
     updateReducedBands();
+    updatePeakBands();
     updateMotionState();
     updateCenterDisc();
 
-    if (changed) {
+    _wave_phase += 0.22f;
+    if (_wave_phase > 2.0f * _pi) {
+        _wave_phase -= 2.0f * _pi;
+    }
+
+    // Bloom keeps rotating and Wave keeps scrolling even while the input is quiet.
+    if (changed || _mode == Mode::Bloom || _mode == Mode::Wave) {
         invalidateSpectrum();
     }
 }
 
 void FftView::updateCenterDisc()
 {
-    if (_center_disc == nullptr) {
+    if (_center_disc == nullptr || !showsCenterReadout()) {
         return;
     }
 
@@ -243,6 +351,17 @@ void FftView::updateReducedBands()
     }
 }
 
+void FftView::updatePeakBands()
+{
+    for (std::size_t i = 0; i < band_count; ++i) {
+        if (_display_bands[i] >= _peak_bands[i]) {
+            _peak_bands[i] = _display_bands[i];
+        } else {
+            _peak_bands[i] = std::max(0.0f, _peak_bands[i] - _peak_fall_rate);
+        }
+    }
+}
+
 void FftView::updateMotionState()
 {
     _bar_blend += 0.035f;
@@ -277,78 +396,45 @@ void FftView::invalidateSpectrum()
     }
 }
 
-namespace {
-
-void spectrum_draw_event_cb(lv_event_t* e)
+void FftView::drawBloom(lv_layer_t* layer, const lv_point_t& center) const
 {
-    auto* view = static_cast<FftView*>(lv_event_get_user_data(e));
-    if (view == nullptr) {
-        return;
-    }
-
-    lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_REFR_EXT_DRAW_SIZE) {
-        lv_event_set_ext_draw_size(e, _ext_draw_size);
-        return;
-    }
-
-    if (code == LV_EVENT_COVER_CHECK) {
-        lv_event_set_cover_res(e, LV_COVER_RES_NOT_COVER);
-        return;
-    }
-
-    if (code != LV_EVENT_DRAW_MAIN_BEGIN) {
-        return;
-    }
-
-    lv_obj_t* obj     = lv_event_get_target_obj(e);
-    lv_layer_t* layer = lv_event_get_layer(e);
-    lv_opa_t opa      = lv_obj_get_style_opa_recursive(obj, LV_PART_MAIN);
-    if (opa <= LV_OPA_MIN) {
-        return;
-    }
-
-    lv_area_t coords;
-    lv_obj_get_coords(obj, &coords);
-
-    lv_point_t center = {
-        static_cast<lv_coord_t>(coords.x1 + lv_obj_get_width(obj) / 2),
-        static_cast<lv_coord_t>(coords.y1 + lv_obj_get_height(obj) / 2),
-    };
-
     lv_draw_triangle_dsc_t draw_dsc;
     lv_draw_triangle_dsc_init(&draw_dsc);
     draw_dsc.opa = LV_OPA_COVER;
 
-    std::array<int, FftView::band_count> radii = {};
+    std::array<int, band_count> radii = {};
     radii.fill(_bar_rest_radius);
 
-    for (std::size_t s = 0; s < FftView::reduced_band_count; ++s) {
+    for (std::size_t s = 0; s < reduced_band_count; ++s) {
         int band_w    = _band_widths[s];
-        int amplitude = static_cast<int>((_bar_max_radius - _bar_rest_radius) * clamp_band(view->reducedBands()[s]));
+        int amplitude = static_cast<int>((_bar_max_radius - _bar_rest_radius) * clamp_band(_reduced_bands[s]));
 
         for (int f = 0; f < band_w; ++f) {
             int32_t ampl_mod = get_cos(f * 360 / band_w + 180, 180) + 180;
             int t            = _bar_per_band_cnt * static_cast<int>(s) - band_w / 2 + f;
             if (t < 0) {
-                t += static_cast<int>(FftView::band_count);
+                t += static_cast<int>(band_count);
             }
-            if (t >= static_cast<int>(FftView::band_count)) {
-                t -= static_cast<int>(FftView::band_count);
+            if (t >= static_cast<int>(band_count)) {
+                t -= static_cast<int>(band_count);
             }
 
             radii[t] += (amplitude * ampl_mod) >> 9;
         }
     }
 
-    for (std::size_t i = 0; i < FftView::band_count; ++i) {
-        int j          = (static_cast<int>(i) + view->barRotation() +
-                          _rnd_array[view->barOffset() % static_cast<int>(_rnd_array.size())]) %
-                         static_cast<int>(FftView::band_count);
-        int k          = (static_cast<int>(i) + view->barRotation() +
-                          _rnd_array[(view->barOffset() + 1) % static_cast<int>(_rnd_array.size())]) %
-                         static_cast<int>(FftView::band_count);
-        int radius     = static_cast<int>(radii[k] * view->barBlend() + radii[j] * (1.0f - view->barBlend()));
+    // On top of the reduced envelope, every individual band pushes out its own petal
+    // so all 20 values are visible instead of only the four group averages.
+    for (std::size_t i = 0; i < band_count; ++i) {
+        radii[i] += static_cast<int>((_bar_max_radius - _bar_rest_radius) * 0.30f * clamp_band(_display_bands[i]));
+    }
+
+    for (std::size_t i = 0; i < band_count; ++i) {
+        int j = (static_cast<int>(i) + _bar_rot + _rnd_array[_bar_ofs % static_cast<int>(_rnd_array.size())]) %
+                static_cast<int>(band_count);
+        int k = (static_cast<int>(i) + _bar_rot + _rnd_array[(_bar_ofs + 1) % static_cast<int>(_rnd_array.size())]) %
+                static_cast<int>(band_count);
+        int radius     = static_cast<int>(radii[k] * _bar_blend + radii[j] * (1.0f - _bar_blend));
         draw_dsc.color = mix_bar_color(radius);
 
         int32_t deg_space   = 1;
@@ -378,4 +464,204 @@ void spectrum_draw_event_cb(lv_event_t* e)
     }
 }
 
-}  // namespace
+void FftView::drawBars(lv_layer_t* layer, const lv_point_t& center) const
+{
+    const int32_t baseline = center.y + _bars_baseline_y;
+
+    for (std::size_t i = 0; i < band_count; ++i) {
+        const float level  = clamp_band(_display_bands[i]);
+        const int32_t x    = center.x + column_x(i);
+        const int32_t x1   = x - _bars_width / 2;
+        const int32_t x2   = x + _bars_width / 2;
+        const int32_t high = static_cast<int32_t>(std::lround(_bars_min_height + level * _bars_span));
+
+        fill_rect(layer, x1, baseline - high, x2, baseline, mix_level_color(level), LV_OPA_COVER, 3);
+
+        // Classic analyzer peak cap, hanging above the bar as it falls back.
+        const float peak = clamp_band(_peak_bands[i]);
+        const int32_t cap =
+            baseline - static_cast<int32_t>(std::lround(_bars_min_height + peak * _bars_span)) - _bars_cap_height;
+        fill_rect(layer, x1, cap, x2, cap + _bars_cap_height, lv_color_hex(_disc_color), LV_OPA_90, 2);
+    }
+
+    fill_rect(layer, center.x - 172, baseline + 2, center.x + 172, baseline + 4, lv_color_hex(_bar_color1), LV_OPA_30,
+              2);
+}
+
+void FftView::drawRing(lv_layer_t* layer, const lv_point_t& center) const
+{
+    lv_draw_line_dsc_t dsc;
+    lv_draw_line_dsc_init(&dsc);
+    dsc.width       = _ring_line_width;
+    dsc.round_start = 1;
+    dsc.round_end   = 1;
+    dsc.opa         = LV_OPA_COVER;
+
+    const float step = 360.0f / static_cast<float>(band_count);
+
+    for (std::size_t i = 0; i < band_count; ++i) {
+        const float level = clamp_band(_display_bands[i]);
+        const float angle = (static_cast<float>(i) * step - 90.0f) * _pi / 180.0f;
+        const float dx    = std::cos(angle);
+        const float dy    = std::sin(angle);
+        const float outer = _ring_inner_radius + level * _ring_span;
+
+        dsc.color = mix_level_color(level);
+        set_line_points(dsc, center.x + dx * _ring_inner_radius, center.y + dy * _ring_inner_radius,
+                        center.x + dx * outer, center.y + dy * outer);
+        lv_draw_line(layer, &dsc);
+
+        const float peak = clamp_band(_peak_bands[i]);
+        const float cap  = _ring_inner_radius + peak * _ring_span;
+        fill_dot(layer, center.x + dx * cap, center.y + dy * cap, 4.0f, lv_color_hex(_disc_color), LV_OPA_80);
+    }
+}
+
+void FftView::drawWave(lv_layer_t* layer, const lv_point_t& center) const
+{
+    lv_draw_line_dsc_t axis_dsc;
+    lv_draw_line_dsc_init(&axis_dsc);
+    axis_dsc.color = lv_color_hex(_bar_color1);
+    axis_dsc.width = 2;
+    axis_dsc.opa   = LV_OPA_20;
+    set_line_points(axis_dsc, center.x - _wave_half_span, center.y, center.x + _wave_half_span, center.y);
+    lv_draw_line(layer, &axis_dsc);
+
+    lv_draw_line_dsc_t dsc;
+    lv_draw_line_dsc_init(&dsc);
+    dsc.width       = 5;
+    dsc.round_start = 1;
+    dsc.round_end   = 1;
+    dsc.opa         = LV_OPA_COVER;
+
+    const float dx = (_wave_half_span * 2.0f) / static_cast<float>(_wave_point_count - 1);
+
+    float prev_x = 0.0f;
+    float prev_y = 0.0f;
+
+    for (int i = 0; i < _wave_point_count; ++i) {
+        // Every sample along the trace is owned by one band, so the whole spectrum
+        // shapes the envelope from left to right.
+        const std::size_t band =
+            std::min<std::size_t>(band_count - 1, static_cast<std::size_t>(i) * band_count / _wave_point_count);
+        const float level = clamp_band(_display_bands[band]);
+        const float x     = center.x - _wave_half_span + dx * static_cast<float>(i);
+        const float y = center.y + level * _wave_amplitude * std::sin(static_cast<float>(i) * _wave_step + _wave_phase);
+
+        if (i > 0) {
+            dsc.color = mix_level_color(level);
+            set_line_points(dsc, prev_x, prev_y, x, y);
+            lv_draw_line(layer, &dsc);
+        }
+
+        prev_x = x;
+        prev_y = y;
+    }
+}
+
+void FftView::drawTunnel(lv_layer_t* layer, const lv_point_t& center) const
+{
+    lv_draw_arc_dsc_t dsc;
+    lv_draw_arc_dsc_init(&dsc);
+    dsc.center      = center;
+    dsc.start_angle = 0;
+    dsc.end_angle   = 360;
+    dsc.rounded     = 0;
+
+    // Bass sits innermost, treble on the outside: one ring per band, thickness is its level.
+    for (std::size_t i = 0; i < band_count; ++i) {
+        const float level = clamp_band(_display_bands[i]);
+        dsc.radius        = static_cast<uint16_t>(_tunnel_inner_radius + static_cast<int>(i) * _tunnel_pitch);
+        dsc.width         = 2 + static_cast<int32_t>(std::lround(level * 5.0f));
+        dsc.color         = mix_level_color(level);
+        dsc.opa           = static_cast<lv_opa_t>(std::lround(50.0f + level * 205.0f));
+        lv_draw_arc(layer, &dsc);
+    }
+}
+
+void FftView::drawMatrix(lv_layer_t* layer, const lv_point_t& center) const
+{
+    const float row_pitch = static_cast<float>(_matrix_bottom_y - _matrix_top_y) / static_cast<float>(_matrix_rows - 1);
+
+    for (std::size_t i = 0; i < band_count; ++i) {
+        const float level  = clamp_band(_display_bands[i]);
+        const float peak   = clamp_band(_peak_bands[i]);
+        const int lit_rows = static_cast<int>(std::lround(level * _matrix_rows));
+        const int peak_row = std::max(0, static_cast<int>(std::lround(peak * _matrix_rows)) - 1);
+        const float x      = static_cast<float>(center.x + column_x(i));
+
+        for (int row = 0; row < _matrix_rows; ++row) {
+            const float y     = static_cast<float>(center.y + _matrix_bottom_y) - row_pitch * static_cast<float>(row);
+            const float shade = static_cast<float>(row) / static_cast<float>(_matrix_rows - 1);
+
+            if (row < lit_rows) {
+                fill_dot(layer, x, y, _matrix_dot_r, mix_level_color(shade), LV_OPA_COVER);
+            } else if (row == peak_row) {
+                fill_dot(layer, x, y, _matrix_dot_r, lv_color_hex(_disc_color), LV_OPA_80);
+            } else {
+                fill_dot(layer, x, y, _matrix_dot_r - 2.0f, lv_color_hex(_bar_color1), LV_OPA_20);
+            }
+        }
+    }
+}
+
+void FftView::drawEventCb(lv_event_t* e)
+{
+    auto* self = static_cast<FftView*>(lv_event_get_user_data(e));
+    if (self == nullptr) {
+        return;
+    }
+
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_REFR_EXT_DRAW_SIZE) {
+        lv_event_set_ext_draw_size(e, _ext_draw_size);
+        return;
+    }
+
+    if (code == LV_EVENT_COVER_CHECK) {
+        lv_event_set_cover_res(e, LV_COVER_RES_NOT_COVER);
+        return;
+    }
+
+    if (code != LV_EVENT_DRAW_MAIN_BEGIN) {
+        return;
+    }
+
+    lv_obj_t* obj     = lv_event_get_target_obj(e);
+    lv_layer_t* layer = lv_event_get_layer(e);
+    lv_opa_t opa      = lv_obj_get_style_opa_recursive(obj, LV_PART_MAIN);
+    if (opa <= LV_OPA_MIN) {
+        return;
+    }
+
+    lv_area_t coords;
+    lv_obj_get_coords(obj, &coords);
+
+    lv_point_t center = {
+        static_cast<int32_t>(coords.x1 + lv_obj_get_width(obj) / 2),
+        static_cast<int32_t>(coords.y1 + lv_obj_get_height(obj) / 2),
+    };
+
+    switch (self->_mode) {
+        case Mode::Bloom:
+            self->drawBloom(layer, center);
+            break;
+        case Mode::Bars:
+            self->drawBars(layer, center);
+            break;
+        case Mode::Ring:
+            self->drawRing(layer, center);
+            break;
+        case Mode::Wave:
+            self->drawWave(layer, center);
+            break;
+        case Mode::Tunnel:
+            self->drawTunnel(layer, center);
+            break;
+        case Mode::Matrix:
+            self->drawMatrix(layer, center);
+            break;
+        default:
+            break;
+    }
+}

@@ -96,6 +96,21 @@ struct DateYmd {
     }
 };
 
+struct PedometerStorageSnapshot {
+    static constexpr uint8_t currentVersion = 1;
+
+    uint8_t version                      = currentVersion;
+    uint8_t reserved[3]                  = {};
+    int32_t dateKey                      = 0;
+    uint32_t totalSteps                  = 0;
+    std::array<uint32_t, 24> hourlySteps = {};
+
+    bool isValid() const
+    {
+        return version == currentVersion && dateKey >= 20000101 && dateKey <= 20991231;
+    }
+};
+
 /**
  * @brief
  *
@@ -185,17 +200,45 @@ public:
     TouchPoint getTouchPoint();
 
     /* ---------------------------------- Audio --------------------------------- */
-    void setSpeakerVolume(int volume, bool saveToSettings = false);
-    int getSpeakerVolume(bool loadFromSettings = false);
-    int getAudioSampleRate();
-    void audioRecord(std::vector<int16_t>& data, uint16_t durationMs, float gain = 30.0f);
-    void audioPlay(std::vector<int16_t>& data, bool async = true);
-
     struct AudioSpectrumFrame {
         static constexpr std::size_t bandCount = 20;
         std::array<float, bandCount> bands     = {};
         float peakFrequencyHz                  = 0.0f;
     };
+
+    struct AudioStreamStats {
+        uint32_t writtenFrames = 0;
+        uint32_t failedFrames  = 0;
+        int lastError          = 0;
+    };
+
+    enum class AudioInputMode : uint8_t {
+        I2s1LeftCodec = 0,
+        I2s1RightCodec,
+        I2s1LeftRaw,
+        I2s1RightRaw,
+        I2s0LeftRaw,
+        I2s0RightRaw,
+        Count,
+    };
+
+    void setSpeakerVolume(int volume, bool saveToSettings = false);
+    int getSpeakerVolume(bool loadFromSettings = false);
+    int getAudioSampleRate();
+    void audioRecord(std::vector<int16_t>& data, uint16_t durationMs, float gain = 30.0f);
+    void audioPlay(std::vector<int16_t>& data, bool async = true);
+    void audioStreamWrite(const std::vector<int16_t>& data);
+    bool audioDuplexStart();
+    void audioDuplexStop();
+    void audioDuplexRecord(std::vector<int16_t>& data, uint16_t durationMs, float gain = 30.0f);
+    void audioDuplexStreamWrite(const std::vector<int16_t>& data);
+    AudioStreamStats getAudioStreamStats();
+    void setSpeakerEnabled(bool enabled);
+    void setAudioInputMode(AudioInputMode mode);
+    AudioInputMode getAudioInputMode() const;
+    const char* getAudioInputModeName() const;
+    std::array<uint8_t, AudioSpectrumFrame::bandCount> audioAnalyzePacket(const std::vector<int16_t>& data);
+
     void updateAudioSpectrum();
     const AudioSpectrumFrame& getAudioSpectrum() const
     {
@@ -222,6 +265,12 @@ public:
     {
         return _imu_data;
     }
+    void updatePedometer();
+    const PedometerStorageSnapshot& getPedometerData() const
+    {
+        return _pedometer_data;
+    }
+    bool flushPedometerData();
 
     /* ---------------------------------- Time ---------------------------------- */
     void syncRtcTimeToSystem();
@@ -247,7 +296,7 @@ public:
         bool vibrateEnabled = true;
     };
 
-    void updateButtonStates();
+    void updateButtonStates(bool feedback = true);
     void setButtonConfig(ButtonConfig config, bool saveToSettings = false);
     const ButtonConfig& getButtonConfig(bool loadFromSettings = false);
 
@@ -265,6 +314,12 @@ private:
 
     i2c_bus_handle_t _i2c_bus = nullptr;
     ImuData _imu_data;
+    PedometerStorageSnapshot _pedometer_data;
+    uint32_t _pedometer_last_raw     = 0;
+    uint32_t _pedometer_last_poll_ms = 0;
+    int _pedometer_last_hour         = -1;
+    bool _pedometer_raw_initialized  = false;
+    bool _pedometer_dirty            = false;
     ButtonConfig _btn_config;
     AudioSpectrumFrame _audio_spectrum;
     int _bl_brightness = 80;
@@ -282,6 +337,7 @@ private:
     void lvgl_init();
     void audio_init();
     void imu_init();
+    void pedometer_init();
     void rtc_init();
     void button_init();
     void fs_init();

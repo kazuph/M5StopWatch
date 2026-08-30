@@ -86,17 +86,36 @@ void AppLauncher::onLauncherClose()
     _status_bar_create_tick    = 0;
     _last_charge_check_tick    = 0;
     _was_battery_charging      = false;
-    _view.reset();
+
+    // The icon tree is kept alive and only parked, see create_launcher_view().
+    if (_view) {
+        _view->hide();
+    }
+
+    // The status bar is still torn down here, so it never shows over another app.
     view::destroy_status_bar();
 }
 
 void AppLauncher::onLauncherDestroy()
 {
-    mclog::tagInfo(getAppInfo().name, "on close");
+    mclog::tagInfo(getAppInfo().name, "on destroy");
+
+    LvglLockGuard lock;
+    _view.reset();
 }
 
 void AppLauncher::create_launcher_view()
 {
+    // The launcher tree is five copies of every installed app icon, which used to be
+    // destroyed on every app open and rebuilt on every app close. That rebuild was the
+    // dominant cost of a launcher <-> app round trip, so it now happens once and the
+    // tree is parked instead. AppLauncherBase documents this exact choice: onLauncherOpen
+    // may "create or show" the UI and the sleeping side may "destroy or hide" it.
+    if (_view) {
+        _view->show();
+        return;
+    }
+
     _view = std::make_unique<view::LauncherView>();
     _view->init(getAppProps());
     _view->onAppClicked = [&](int appID) {

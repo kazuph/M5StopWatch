@@ -30,12 +30,17 @@ extern "C" void app_main(void)
 
     // Install apps
     GetMooncake().installApp(std::make_unique<AppLauncher>());
+    GetMooncake().installApp(std::make_unique<AppTransceiver>());
     GetMooncake().installApp(std::make_unique<AppAlarmClock>());
     GetMooncake().installApp(std::make_unique<AppWatchFace>());
     GetMooncake().installApp(std::make_unique<AppStopWatch>());
     GetMooncake().installApp(std::make_unique<AppBadge>());
     GetMooncake().installApp(std::make_unique<AppImu>());
+    GetMooncake().installApp(std::make_unique<AppPedometer>());
     GetMooncake().installApp(std::make_unique<AppFft>());
+    GetMooncake().installApp(std::make_unique<AppTuner>());
+    GetMooncake().installApp(std::make_unique<AppEarGame>());
+    GetMooncake().installApp(std::make_unique<AppPomodoro>());
     GetMooncake().installApp(std::make_unique<AppLuckyWheel>());
     GetMooncake().installApp(std::make_unique<AppSetup>());
     // GetMooncake().installApp(std::make_unique<AppTemplate>());
@@ -43,6 +48,7 @@ extern "C" void app_main(void)
     // Main loop
     while (1) {
         GetHAL().feedTheDog();
+        GetHAL().updatePedometer();
         GetMooncake().update();
     }
 }
