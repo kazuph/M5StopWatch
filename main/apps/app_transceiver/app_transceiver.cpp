@@ -602,23 +602,21 @@ void AppTransceiver::captureAudioTask()
             if (!_capture_enabled.load() || source.size() < transceiver::sourceSamplesPerPacket) {
                 continue;
             }
-            const auto spectrum                                              = GetHAL().audioAnalyzePacket(source);
-            std::array<int16_t, transceiver::sourceSamplesPerPacket> capture = {};
-            std::copy_n(source.begin(), capture.size(), capture.begin());
+            const auto spectrum = GetHAL().audioAnalyzePacket(source);
+            std::copy_n(source.begin(), _capture_pcm.size(), _capture_pcm.begin());
 
-            transceiver::AudioPacket packet;
-            packet.header.type     = transceiver::PacketType::Audio;
-            packet.header.session  = session;
-            packet.header.sequence = _sequence.fetch_add(1) + 1;
-            packet.talker          = role;
-            packet.spectrum        = spectrum;
-            packet.samples         = transceiver::g711::encodeFrame<transceiver::captureSampleRate>(capture);
+            _capture_packet.header.type     = transceiver::PacketType::Audio;
+            _capture_packet.header.session  = session;
+            _capture_packet.header.sequence = _sequence.fetch_add(1) + 1;
+            _capture_packet.talker          = role;
+            _capture_packet.spectrum        = spectrum;
+            _capture_packet.samples = transceiver::g711::encodeFrame<transceiver::captureSampleRate>(_capture_pcm);
             _captured_audio_frames.fetch_add(1);
-            const bool sent = _radio.sendToBlocking(peer, &packet, sizeof(packet));
+            const bool sent = _radio.sendToBlocking(peer, &_capture_packet, sizeof(_capture_packet));
 
             std::lock_guard<std::mutex> lock(_capture_mutex);
             _captured_spectrum = spectrum;
-            for (const int16_t sample : capture) {
+            for (const int16_t sample : _capture_pcm) {
                 const int64_t value = sample;
                 ++_tx_sample_count;
                 _tx_sample_sum += value;
@@ -631,7 +629,7 @@ void AppTransceiver::captureAudioTask()
             }
             if (sent) {
                 ++_tx_audio_frames;
-                _tx_audio_peak = std::max(_tx_audio_peak, peakAmplitude(capture.data(), capture.size()));
+                _tx_audio_peak = std::max(_tx_audio_peak, peakAmplitude(_capture_pcm.data(), _capture_pcm.size()));
             }
         }
     }

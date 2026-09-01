@@ -1,5 +1,6 @@
 #include "app_ear_game.h"
 
+#include <apps/app_transceiver/model/volume.h>
 #include <assets/assets.h>
 #include <esp_random.h>
 #include <hal/hal.h>
@@ -19,14 +20,32 @@ void AppEarGame::onOpen()
     LvglLockGuard lock;
     _view = std::make_unique<view::EarGameView>();
     _view->init(lv_screen_active());
+    _view->setVolumePercent(GetHAL().getSpeakerVolume());
     bindView();
 }
 
 void AppEarGame::onRunning()
 {
-    if (_keyManager && _keyManager->update() == input::KeyEvent::GoHome) {
+    if (!_keyManager) {
+        return;
+    }
+    const input::KeyEvent event = _keyManager->update();
+    if (event == input::KeyEvent::GoHome) {
         close();
         return;
+    }
+    if (event == input::KeyEvent::GoPrevious) {
+        const int volume = transceiver::volume::nextPreset(GetHAL().getSpeakerVolume());
+        GetHAL().setSpeakerVolume(volume, true);
+        {
+            LvglLockGuard lock;
+            _view->setVolumePercent(volume);
+        }
+        if (_hasQuestion && volume > 0) {
+            playQuestionOnce();
+        }
+    } else if (event == input::KeyEvent::GoNext && _hasQuestion) {
+        playQuestionOnce();
     }
 }
 
@@ -64,9 +83,14 @@ void AppEarGame::playQuestionOnce()
     if (!_hasQuestion) {
         return;
     }
+    const int volume = GetHAL().getSpeakerVolume();
+    if (volume <= 0) {
+        mclog::tagWarn(getAppInfo().name, "question playback skipped because speaker is muted");
+        return;
+    }
     auto audio = ear_game::renderQuestionAudio(_question.sounds);
     mclog::tagInfo(getAppInfo().name, "play question once: samples={}, volume={}", audio.size(),
-                   GetHAL().getSpeakerVolume());
+                   volume);
     GetHAL().audioPlay(audio, true);
 }
 
