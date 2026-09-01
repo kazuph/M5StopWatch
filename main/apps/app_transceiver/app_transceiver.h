@@ -78,6 +78,8 @@ private:
     transceiver::MacAddress _capture_peer                                  = {};
     uint32_t _capture_session                                              = 0;
     transceiver::Role _capture_role                                        = transceiver::Role::None;
+    std::array<int16_t, transceiver::sourceSamplesPerPacket> _capture_pcm  = {};
+    transceiver::AudioPacket _capture_packet                               = {};
     std::array<uint8_t, transceiver::spectrumBandCount> _captured_spectrum = {};
 
     void handlePowerToggle();

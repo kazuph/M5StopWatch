@@ -54,8 +54,13 @@ public:
         _silence_buffer.resize(playback_sample_rate / 10);
         _silence_buffer.assign(_silence_buffer.size(), 0);
         _spectrum_init();
-        xTaskCreate([](void* obj) { static_cast<AudioCodec*>(obj)->_task_entry(); }, "audio_task", 4 * 1024, this, 5,
-                    &_task_handle);
+        const BaseType_t task_result =
+            xTaskCreate([](void* obj) { static_cast<AudioCodec*>(obj)->_task_entry(); }, "audio_task", 4 * 1024, this, 5,
+                        &_task_handle);
+        if (task_result != pdPASS) {
+            _task_handle = nullptr;
+            mclog::tagError(_tag, "failed to create audio play task: {}", task_result);
+        }
 
         audio_codec_i2c_cfg_t i2c_cfg = {};
         i2c_cfg.addr                  = ES8311_CODEC_DEFAULT_ADDR;
@@ -178,9 +183,14 @@ public:
             return;
         }
         if (async) {
+            if (_task_handle == nullptr) {
+                mclog::tagError(_tag, "async playback unavailable: audio play task is not running");
+                return;
+            }
             // Support interruption: overwrite data and notify task
             _audio_data = data;
             _is_playing = true;
+            mclog::tagInfo(_tag, "async playback queued: samples={}", data.size());
             xTaskNotifyGive(_task_handle);
         } else {
             if (_is_playing) {
@@ -605,6 +615,8 @@ private:
                 size_t offset        = 0;
                 size_t total_samples = current_data.size();
                 bool interrupted     = false;
+                int write_result     = ESP_CODEC_DEV_OK;
+                mclog::tagInfo(_tag, "async playback started: samples={}", total_samples);
                 // Chunk size in samples (e.g. 1024 bytes = 512 samples)
                 const size_t CHUNK_SAMPLES = 512;
 
@@ -623,7 +635,12 @@ private:
                                                current_data.begin() + offset + write_samples);
                     {
                         std::lock_guard<std::mutex> lock(_mutex);
-                        _write_mono_locked(chunk);
+                        write_result = _write_mono_locked(chunk);
+                    }
+                    if (write_result != ESP_CODEC_DEV_OK) {
+                        mclog::tagError(_tag, "async playback write failed: result={}, offset={}, samples={}",
+                                        write_result, offset, write_samples);
+                        break;
                     }
                     offset += write_samples;
                 }
@@ -638,10 +655,21 @@ private:
                     continue;
                 }
 
+                if (write_result != ESP_CODEC_DEV_OK) {
+                    std::lock_guard<std::mutex> lock(_mutex);
+                    _is_playing = false;
+                    break;
+                }
+
                 // Normal finish, play silence to avoid pop/waiting
                 {
                     std::lock_guard<std::mutex> lock(_mutex);
-                    _write_mono_locked(_silence_buffer);
+                    write_result = _write_mono_locked(_silence_buffer);
+                }
+                if (write_result != ESP_CODEC_DEV_OK) {
+                    mclog::tagError(_tag, "async playback trailing silence failed: result={}", write_result);
+                } else {
+                    mclog::tagInfo(_tag, "async playback completed: samples={}", total_samples);
                 }
             }
         }
@@ -860,7 +888,7 @@ private:
     const audio_codec_gpio_if_t* _duplex_gpio_if = NULL;
     const audio_codec_if_t* _duplex_codec_if     = NULL;
 
-    TaskHandle_t _task_handle;
+    TaskHandle_t _task_handle = nullptr;
     std::mutex _mutex;
     std::mutex _input_io_mutex;
     std::mutex _output_io_mutex;

@@ -42,6 +42,10 @@ void EarGameView::init(lv_obj_t* parent)
     lv_obj_set_style_pad_all(_root, 0, LV_PART_MAIN);
     lv_obj_remove_flag(_root, LV_OBJ_FLAG_SCROLLABLE);
     showModeSelection();
+
+    _volume = lv_label_create(_root);
+    styleLabel(_volume, colorDim);
+    lv_obj_align(_volume, LV_ALIGN_CENTER, 0, 205);
 }
 
 void EarGameView::clearContent()
@@ -110,7 +114,7 @@ void EarGameView::showQuestion(const ear_game::Question& question)
     lv_obj_add_event_cb(_play, playEvent, LV_EVENT_CLICKED, this);
 
     for (int i = 0; i < 3; ++i) {
-        _choices[i] = makeButton(question.choices[i].c_str(), -25 + i * 74, i == 0 ? colorBlue : colorDim);
+        _choices[i] = makeButton(question.choices[i].c_str(), -25 + i * 74, colorDim);
         lv_obj_add_event_cb(_choices[i], choiceEvent, LV_EVENT_CLICKED, this);
     }
 }
@@ -132,6 +136,16 @@ void EarGameView::showAnswer(bool correct, const std::string& detail)
 
     auto* next = makeButton("ツギノ モンダイ", 100, colorGreen);
     lv_obj_add_event_cb(next, nextEvent, LV_EVENT_CLICKED, this);
+}
+
+void EarGameView::setVolumePercent(int volume)
+{
+    if (_volume == nullptr) {
+        return;
+    }
+    const std::string text = volume <= 0 ? "キイロ: ミュート" : "キイロ: オンリョウ " + std::to_string(volume) + "%";
+    lv_label_set_text(_volume, text.c_str());
+    lv_obj_align(_volume, LV_ALIGN_CENTER, 0, 205);
 }
 
 void EarGameView::modeEvent(lv_event_t* event)

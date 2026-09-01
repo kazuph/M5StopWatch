@@ -13,6 +13,7 @@ public:
     void showModeSelection();
     void showQuestion(const ear_game::Question& question);
     void showAnswer(bool correct, const std::string& detail);
+    void setVolumePercent(int volume);
 
     std::function<void(ear_game::Mode)> onModeSelected;
     std::function<void()> onPlay;
@@ -29,6 +30,7 @@ private:
 
     lv_obj_t* _root = nullptr;
     lv_obj_t* _content = nullptr;
+    lv_obj_t* _volume = nullptr;
     lv_obj_t* _play = nullptr;
     lv_obj_t* _choices[3] = {};
 };
